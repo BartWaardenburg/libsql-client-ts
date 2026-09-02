@@ -473,6 +473,65 @@ describe("execute()", () => {
             }),
         );
         test(
+            "client.close() settles operations that are waiting for a connection",
+            withLocalClient(async (c) => {
+                await c.execute("CREATE TABLE t (a)");
+
+                // the first borrows a connection, the rest queue behind it
+                const inFlight = [
+                    c.execute("SELECT 1"),
+                    c.execute("SELECT 2"),
+                    c.execute("SELECT 3"),
+                ];
+                // stop them becoming unhandled rejections while we close
+                inFlight.forEach((p) => p.catch(() => {}));
+                c.close();
+
+                // none of these may hang: a queued waiter that is dropped
+                // rather than rejected never settles at all
+                for (const pending of inFlight) {
+                    await expect(
+                        Promise.race([
+                            pending,
+                            new Promise((_, reject) =>
+                                setTimeout(
+                                    () => reject(new Error("never settled")),
+                                    2000,
+                                ),
+                            ),
+                        ]),
+                    ).rejects.toBeLibsqlError("CLIENT_CLOSED");
+                }
+            }),
+        );
+        test(
+            "client.reconnect() settles operations that are waiting for a connection",
+            withLocalClient(async (c) => {
+                await c.execute("CREATE TABLE t (a)");
+
+                const inFlight = [c.execute("SELECT 1"), c.execute("SELECT 2")];
+                inFlight.forEach((p) => p.catch(() => {}));
+                await c.reconnect();
+
+                for (const pending of inFlight) {
+                    await expect(
+                        Promise.race([
+                            pending,
+                            new Promise((_, reject) =>
+                                setTimeout(
+                                    () => reject(new Error("never settled")),
+                                    2000,
+                                ),
+                            ),
+                        ]),
+                    ).rejects.toBeLibsqlError("CLIENT_CLOSED");
+                }
+
+                // the client is usable again afterwards
+                await expect(c.execute("SELECT 1")).resolves.toBeDefined();
+            }),
+        );
+        test(
             "client.close() with an open transaction does not crash",
             withLocalClient(async (c) => {
                 await c.execute("CREATE TABLE t (a)");

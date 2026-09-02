@@ -132,7 +132,10 @@ export class ConnectionPool {
     #borrowed: Set<Database.Database>;
     // the subset of `#borrowed` held by an open transaction
     #heldByTransaction: Set<Database.Database>;
-    #waiters: Array<(db: Database.Database) => void>;
+    #waiters: Array<{
+        resolve: (db: Database.Database) => void;
+        reject: (e: unknown) => void;
+    }>;
     #closed: boolean;
 
     constructor(
@@ -173,12 +176,15 @@ export class ConnectionPool {
                     ),
                 );
             }
-            return new Promise((resolve) =>
-                this.#waiters.push((db) => {
-                    if (forTransaction) {
-                        this.#heldByTransaction.add(db);
-                    }
-                    resolve(db);
+            return new Promise((resolve, reject) =>
+                this.#waiters.push({
+                    resolve: (db) => {
+                        if (forTransaction) {
+                            this.#heldByTransaction.add(db);
+                        }
+                        resolve(db);
+                    },
+                    reject,
                 }),
             );
         }
@@ -228,7 +234,7 @@ export class ConnectionPool {
         const waiter = this.#waiters.shift();
         if (waiter !== undefined) {
             this.#borrowed.add(db);
-            waiter(db);
+            waiter.resolve(db);
         } else {
             this.#idle.push(db);
         }
@@ -245,8 +251,16 @@ export class ConnectionPool {
         }
         this.#borrowed.clear();
         this.#heldByTransaction.clear();
-        // anything still waiting will never be served; let it fail loudly
+
+        // Anything still queued will never be served now. Reject it: dropping
+        // the callbacks would leave those operations pending forever.
+        const waiters = this.#waiters;
         this.#waiters = [];
+        for (const waiter of waiters) {
+            waiter.reject(
+                new LibsqlError("The client is closed", "CLIENT_CLOSED"),
+            );
+        }
     }
 
     reopen(): void {
@@ -310,6 +324,7 @@ export class Sqlite3Client implements Client {
         this.#checkNotClosed();
         const db = await this.#pool.acquire();
         try {
+            this.#checkUsable(db);
             return executeStmt(db, stmt, this.#intMode);
         } finally {
             this.#pool.release(db);
@@ -323,6 +338,7 @@ export class Sqlite3Client implements Client {
         this.#checkNotClosed();
         const db = await this.#pool.acquire();
         try {
+            this.#checkUsable(db);
             executeStmt(db, transactionModeToBegin(mode), this.#intMode);
             const resultSets = [];
             for (let i = 0; i < stmts.length; i++) {
@@ -370,6 +386,7 @@ export class Sqlite3Client implements Client {
         this.#checkNotClosed();
         const db = await this.#pool.acquire();
         try {
+            this.#checkUsable(db);
             executeStmt(db, "PRAGMA foreign_keys=off", this.#intMode);
             executeStmt(db, transactionModeToBegin("deferred"), this.#intMode);
             const resultSets = [];
@@ -415,6 +432,7 @@ export class Sqlite3Client implements Client {
         this.#checkNotClosed();
         const db = await this.#pool.acquire(true);
         try {
+            this.#checkUsable(db);
             executeStmt(db, transactionModeToBegin(mode), this.#intMode);
         } catch (e) {
             this.#pool.release(db);
@@ -431,6 +449,7 @@ export class Sqlite3Client implements Client {
         this.#checkNotClosed();
         const db = await this.#pool.acquire();
         try {
+            this.#checkUsable(db);
             return executeMultiple(db, sql);
         } finally {
             // `release` rolls back a transaction `sql` left open
@@ -442,6 +461,7 @@ export class Sqlite3Client implements Client {
         this.#checkNotClosed();
         const db = await this.#pool.acquire();
         try {
+            this.#checkUsable(db);
             const rep = await db.sync();
             return {
                 frames_synced: rep.frames_synced,
@@ -465,6 +485,20 @@ export class Sqlite3Client implements Client {
     #checkNotClosed(): void {
         if (this.closed) {
             throw new LibsqlError("The client is closed", "CLIENT_CLOSED");
+        }
+    }
+
+    // `close()` and `reconnect()` are synchronous and can land between a
+    // borrow and the work it was borrowed for, closing the connection under an
+    // operation that is already holding one. Without this the operation
+    // reaches libsql with a closed handle and fails with a raw TypeError.
+    #checkUsable(db: Database.Database): void {
+        this.#checkNotClosed();
+        if (!db.open) {
+            throw new LibsqlError(
+                "The connection was closed while this operation was in flight",
+                "CLIENT_CLOSED",
+            );
         }
     }
 }
